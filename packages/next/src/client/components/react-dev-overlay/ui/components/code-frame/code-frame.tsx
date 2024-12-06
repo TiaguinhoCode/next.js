@@ -9,6 +9,7 @@ import { getFrameSource } from '../../../utils/stack-frame'
 import { useOpenInEditor } from '../../utils/use-open-in-editor'
 import { ExternalIcon } from '../../icons/external'
 import { FileIcon } from '../../icons/file'
+import { isHiddenMethodName } from '../../../../../../shared/lib/stack-trace-utils'
 
 export type CodeFrameProps = { stackFrame: StackFrame; codeFrame: string }
 
@@ -72,10 +73,14 @@ export function CodeFrame({ stackFrame, codeFrame }: CodeFrameProps) {
           <span className="code-frame-icon">
             <FileIcon lang={fileExtension} />
           </span>
-          <span data-text>
-            {getFrameSource(stackFrame)} @{' '}
-            <HotlinkedText text={stackFrame.methodName} />
-          </span>
+          {isHiddenMethodName(stackFrame.methodName) ? (
+            <span data-text>{getFrameSource(stackFrame)}</span>
+          ) : (
+            <span data-text>
+              {getFrameSource(stackFrame)} @{' '}
+              <HotlinkedText text={stackFrame.methodName} />
+            </span>
+          )}
           <button
             aria-label="Open in editor"
             data-with-open-in-editor-link-source-file
