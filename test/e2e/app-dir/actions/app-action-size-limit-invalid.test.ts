@@ -14,7 +14,6 @@ const CONFIG_ERROR =
 describe('app-dir action size limit invalid config', () => {
   const { next, isNextStart, isNextDeploy, skipped } = nextTestSetup({
     files: __dirname,
-    skipDeployment: true,
     skipStart: true,
     dependencies: {
       nanoid: '4.0.1',
