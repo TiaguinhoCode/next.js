@@ -1,4 +1,5 @@
 import type { IncomingHttpHeaders, OutgoingHttpHeaders } from 'node:http'
+import type { Readable, Transform } from 'node:stream'
 import type { SizeLimit } from '../../types'
 import type { RequestStore } from '../app-render/work-unit-async-storage.external'
 import type { AppRenderContext, GenerateFlight } from './app-render'
@@ -48,6 +49,7 @@ import { RedirectStatusCode } from '../../client/components/redirect-status-code
 import { synchronizeMutableCookies } from '../async-storage/request-store'
 import type { TemporaryReferenceSet } from 'react-server-dom-webpack/server.edge'
 import { workUnitAsyncStorage } from '../app-render/work-unit-async-storage.external'
+import { InvariantError } from '../../shared/lib/invariant-error'
 
 function formDataFromSearchQueryString(query: string) {
   const searchParams = new URLSearchParams(query)
@@ -479,7 +481,6 @@ export async function handleAction({
       formState?: any
     }
 > {
-  const contentType = req.headers['content-type']
   const { serverActionsManifest, page } = ctx.renderOpts
 
   const {
@@ -753,56 +754,26 @@ export async function handleAction({
         ) as typeof import('./react-server.node')
 
         temporaryReferences = createTemporaryReferenceSet()
-
-        const { Transform } =
-          require('node:stream') as typeof import('node:stream')
-
-        const defaultBodySizeLimit = '1 MB'
-        const bodySizeLimit =
-          serverActions?.bodySizeLimit ?? defaultBodySizeLimit
-        const bodySizeLimitBytes =
-          bodySizeLimit !== defaultBodySizeLimit
-            ? (
-                require('next/dist/compiled/bytes') as typeof import('bytes')
-              ).parse(bodySizeLimit)
-            : 1024 * 1024 // 1 MB
-
-        let size = 0
-        const sizeLimitedBody = req.body.pipe(
-          new Transform({
-            transform(chunk, encoding, callback) {
-              size += Buffer.byteLength(chunk, encoding)
-              if (size > bodySizeLimitBytes) {
-                const { ApiError } = require('../api-utils')
-
-                callback(
-                  new ApiError(
-                    413,
-                    `Body exceeded ${bodySizeLimit} limit.\n` +
-                      `To configure the body size limit for Server Actions, see: https://nextjs.org/docs/app/api-reference/next-config-js/serverActions#bodysizelimit`
-                  )
-                )
-                return
-              }
-
-              callback(null, chunk)
-            },
-          })
-        )
+        const bodySizeLimit = resolveBodySizeLimitNode(serverActions)
 
         if (isMultipartAction) {
           if (isFetchAction) {
+            const sizeLimitedBody = getSizeLimitedStreamNode(
+              req.body,
+              bodySizeLimit
+            )
+
             const busboy = (require('busboy') as typeof import('busboy'))({
               defParamCharset: 'utf8',
               headers: req.headers,
-              limits: { fieldSize: bodySizeLimitBytes },
+              limits: { fieldSize: bodySizeLimit.byteLength },
             })
 
             const { pipeline } =
               require('node:stream/promises') as typeof import('node:stream/promises')
 
             // we need to use `pipeline` instead of `.pipe()` to propagate size limit errors correctly.
-            pipeline(sizeLimitedBody, busboy).catch(() => {
+            pipeline(sizeLimitedBody.stream, busboy).catch(() => {
               // avoid an unhandled rejection. the error will be handled below in `decodeReplyFromBusboy`
             })
 
@@ -812,49 +783,55 @@ export async function handleAction({
               { temporaryReferences }
             )
           } else {
-            // React doesn't yet publish a busboy version of decodeAction
-            // so we polyfill the parsing of FormData.
-            const fakeRequest = new Request('http://localhost', {
-              method: 'POST',
-              // @ts-expect-error
-              headers: { 'Content-Type': contentType },
-              body: new ReadableStream({
-                start: (controller) => {
-                  sizeLimitedBody.on('data', (chunk) => {
-                    controller.enqueue(new Uint8Array(chunk))
-                  })
-                  sizeLimitedBody.on('end', () => {
-                    controller.close()
-                  })
-                  sizeLimitedBody.on('error', (err) => {
-                    controller.error(err)
-                  })
-                },
-              }),
-              duplex: 'half',
-            })
-            const formData = await fakeRequest.formData()
-            const action = await decodeAction(formData, serverModuleMap)
-            if (typeof action === 'function') {
-              // Only warn if it's a server action, otherwise skip for other post requests
-              warnBadServerActionRequest()
+            const { isMpaActionBodyNode } = require('./is-mpa-action-body')
+            const sizeLimitedBody = getSizeLimitedStreamNode(
+              req.body,
+              bodySizeLimit
+            )
+            sizeLimitedBody.stream.cork() // buffer while `isMpaActionBodyNode` reads the first couple of lines
 
-              const actionReturnedState = await workUnitAsyncStorage.run(
-                requestStore,
-                action
+            if (await isMpaActionBodyNode(req.body, req.headers)) {
+              sizeLimitedBody.stream.uncork()
+
+              // React doesn't yet publish a busboy version of decodeAction
+              // so we polyfill the parsing of FormData.
+              const formData = await parseBodyAsFormDataNode(
+                sizeLimitedBody.stream,
+                req.headers['content-type']
               )
 
-              formState = await decodeFormState(
-                actionReturnedState,
-                formData,
-                serverModuleMap
-              )
+              const action = await decodeAction(formData, serverModuleMap)
+              if (typeof action === 'function') {
+                // Only warn if it's a server action, otherwise skip for other post requests
+                warnBadServerActionRequest()
 
-              requestStore.phase = 'render'
+                const actionReturnedState = await workUnitAsyncStorage.run(
+                  requestStore,
+                  action
+                )
+
+                formState = await decodeFormState(
+                  actionReturnedState,
+                  formData,
+                  serverModuleMap
+                )
+
+                requestStore.phase = 'render'
+                // Skip the fetch path
+                return
+              } else {
+                // We couldn't decode an action, so this POST request turned out not to be
+                // a server action request even though it looked like one.
+                // we shouldn't apply size limits to it.
+                sizeLimitedBody.cancel()
+                return
+              }
+            } else {
+              // not a server action request.
+              // we shouldn't apply size limits to it.
+              sizeLimitedBody.cancel()
+              return
             }
-
-            // Skip the fetch path
-            return
           }
         } else {
           try {
@@ -868,8 +845,13 @@ export async function handleAction({
             }
           }
 
+          const sizeLimitedBody = getSizeLimitedStreamNode(
+            req.body,
+            bodySizeLimit
+          )
+
           const chunks: Buffer[] = []
-          for await (const chunk of sizeLimitedBody) {
+          for await (const chunk of sizeLimitedBody.stream) {
             chunks.push(Buffer.from(chunk))
           }
 
@@ -1055,6 +1037,98 @@ export async function handleAction({
     }
 
     throw err
+  }
+}
+
+async function parseBodyAsFormDataNode(
+  body: Readable,
+  contentType: string | undefined
+): Promise<FormData> {
+  if (process.env.NEXT_RUNTIME === 'edge') {
+    throw new InvariantError('This function cannot be used in the edge runtime')
+  } else {
+    const fakeRequest = new Request('http://localhost', {
+      method: 'POST',
+      // @ts-expect-error
+      headers: { 'Content-Type': contentType },
+      body: new ReadableStream({
+        start: (controller) => {
+          body.on('data', (chunk) => {
+            controller.enqueue(new Uint8Array(chunk))
+          })
+          body.on('end', () => {
+            controller.close()
+          })
+          body.on('error', (err) => {
+            controller.error(err)
+          })
+        },
+      }),
+      duplex: 'half',
+    })
+    return await fakeRequest.formData()
+  }
+}
+
+type ResolvedBodySizeLimit = {
+  byteLength: number
+  humanReadable: SizeLimit
+}
+
+function resolveBodySizeLimitNode(
+  serverActions: ServerActionsConfig | undefined
+): ResolvedBodySizeLimit {
+  if (process.env.NEXT_RUNTIME === 'edge') {
+    throw new InvariantError('This function cannot be used in the edge runtime')
+  } else {
+    const defaultBodySizeLimit: SizeLimit = '1MB'
+    const bodySizeLimit = serverActions?.bodySizeLimit ?? defaultBodySizeLimit
+    const byteLength =
+      bodySizeLimit !== defaultBodySizeLimit
+        ? (require('next/dist/compiled/bytes') as typeof import('bytes')).parse(
+            bodySizeLimit
+          )
+        : 1024 * 1024 // 1 MB
+    return {
+      byteLength,
+      humanReadable: bodySizeLimit,
+    }
+  }
+}
+
+function getSizeLimitedStreamNode(
+  sourceStream: Readable,
+  sizeLimit: ResolvedBodySizeLimit
+): { stream: Transform; cancel: () => void } {
+  if (process.env.NEXT_RUNTIME === 'edge') {
+    throw new InvariantError('This function cannot be used in the edge runtime')
+  } else {
+    const { Transform } = require('node:stream') as typeof import('node:stream')
+
+    let size = 0
+    const limiter = new Transform({
+      transform(chunk, encoding, callback) {
+        size += Buffer.byteLength(chunk, encoding)
+        if (size > sizeLimit.byteLength) {
+          const { ApiError } = require('../api-utils')
+
+          callback(
+            new ApiError(
+              413,
+              `Body exceeded ${sizeLimit.humanReadable} limit.
+                To configure the body size limit for Server Actions, see: https://nextjs.org/docs/app/api-reference/next-config-js/serverActions#bodysizelimit`
+            )
+          )
+          return
+        }
+
+        callback(null, chunk)
+      },
+    })
+
+    const stream = sourceStream.pipe(limiter)
+    const cancel = sourceStream.unpipe.bind(sourceStream, limiter)
+    return { stream: stream, cancel }
   }
 }
 
